@@ -11,43 +11,35 @@
 
 struct Merge : public vsg::Inherit<vsg::Operation, Merge>
 {
-    Merge(const vsg::Path& in_path, vsg::observer_ptr<vsg::Viewer> in_viewer, vsg::ref_ptr<vsg::Group> in_attachmentPoint, vsg::ref_ptr<vsg::Node> in_node, const vsg::CompileResult& in_compileResult):
-        path(in_path),
+    Merge(const vsg::observer_ptr<vsg::Viewer> in_viewer, const vsg::CompileResult& in_compileResult):
         viewer(in_viewer),
-        attachmentPoint(in_attachmentPoint),
-        node(in_node),
         compileResult(in_compileResult) {}
 
     vsg::Path path;
     vsg::observer_ptr<vsg::Viewer> viewer;
-    vsg::ref_ptr<vsg::Group> attachmentPoint;
-    vsg::ref_ptr<vsg::Node> node;
     vsg::CompileResult compileResult;
 
     void run() override
     {
-        std::cout<<"Merge::run() path = "<<path<<", "<<attachmentPoint<<", "<<node<<std::endl;
+        std::cout<<"Merge::run() Add window"<<std::endl;
 
         vsg::ref_ptr<vsg::Viewer> ref_viewer = viewer;
         if (ref_viewer)
         {
             updateViewer(*ref_viewer, compileResult);
         }
-
-        attachmentPoint->addChild(node);
     }
 };
 
-struct LoadViewOperation : public vsg::Inherit<vsg::Operation, LoadViewOperation>
+struct LoadWindowOperation : public vsg::Inherit<vsg::Operation, LoadWindowOperation>
 {
-    LoadViewOperation(vsg::ref_ptr<vsg::Viewer> in_viewer, vsg::ref_ptr<vsg::Window> in_window, int32_t in_x, int32_t in_y, uint32_t in_width, uint32_t in_height, vsg::ref_ptr<vsg::Group> in_attachmentPoint, const vsg::Path& in_filename, vsg::ref_ptr<vsg::Options> in_options) :
+    LoadWindowOperation(vsg::ref_ptr<vsg::Viewer> in_viewer, vsg::ref_ptr<vsg::Window> in_window, int32_t in_x, int32_t in_y, uint32_t in_width, uint32_t in_height, const vsg::Path& in_filename, vsg::ref_ptr<vsg::Options> in_options) :
         viewer(in_viewer),
         window(in_window),
         x(in_x),
         y(in_y),
         width(in_width),
         height(in_height),
-        attachmentPoint(in_attachmentPoint),
         filename(in_filename),
         options(in_options)
     {
@@ -70,6 +62,23 @@ struct LoadViewOperation : public vsg::Inherit<vsg::Operation, LoadViewOperation
         if (auto node = vsg::read_cast<vsg::Node>(filename, options))
         {
             // std::cout << "Loaded " << filename << std::endl;
+            auto traits = vsg::WindowTraits::create();
+            traits->x = x;
+            traits->y = y;
+            traits->width = width;
+            traits->height = height;
+            traits->windowTitle = "Secondary window";
+            traits->debugLayer = ref_window->traits()->debugLayer;
+            traits->apiDumpLayer = ref_window->traits()->apiDumpLayer;
+
+            // use original window for device creation
+            traits->device = ref_window->getOrCreateDevice();
+
+            auto second_window = vsg::Window::create(traits);
+            ref_viewer->addWindow(second_window);
+
+            vsg::ref_ptr<vsg::Group> vsg_scene = vsg::Group::create();
+            vsg_scene->addChild(node);
 
             vsg::ComputeBounds computeBounds;
             node->accept(computeBounds);
@@ -85,19 +94,26 @@ struct LoadViewOperation : public vsg::Inherit<vsg::Operation, LoadViewOperation
             auto perspective = vsg::Perspective::create(30.0, static_cast<double>(width) / static_cast<double>(height),
                                                         nearFarRatio * radius, radius * 4.5);
 
-            auto viewportState = vsg::ViewportState::create(x, y, width, height);
+            auto camera = vsg::Camera::create(perspective, lookAt, vsg::ViewportState::create(VkExtent2D{width, height}));
 
-            auto camera = vsg::Camera::create(perspective, lookAt, viewportState);
-            auto view = vsg::View::create(camera, node);
+            auto view = vsg::View::create(camera, vsg_scene);
             view->addChild(vsg::createHeadlight());
 
-            auto renderGraph = vsg::RenderGraph::create(ref_window, view);
-            renderGraph->setClearValues({{0.2f, 0.2f, 0.2f, 1.0f}});
+            auto trackball = vsg::Trackball::create(camera);
+            trackball->addWindow(second_window);
+            ref_viewer->addEventHandler(trackball);
+
+            auto renderGraph = vsg::RenderGraph::create(second_window, view);
+            renderGraph->clearValues[0].color = {{0.2f, 0.2f, 0.2f, 1.0f}};
+
+            auto commandGraph = vsg::CommandGraph::create(second_window);
+            commandGraph->addChild(renderGraph);
+            ref_viewer->addRecordAndSubmitTaskAndPresentation({commandGraph});
 
             // need to add view to compileManager
-            ref_viewer->compileManager->add(*ref_window, view);
+            ref_viewer->compileManager->add(*second_window, view);
 
-            auto result = ref_viewer->compileManager->compile(renderGraph, [&view](vsg::Context& context)
+            auto result = ref_viewer->compileManager->compile(commandGraph, [&view](vsg::Context& context)
             {
                 if (context.view == view.get())
                 {
@@ -111,7 +127,7 @@ struct LoadViewOperation : public vsg::Inherit<vsg::Operation, LoadViewOperation
                 }
             });
 
-            if (result) ref_viewer->addUpdateOperation(Merge::create(filename, viewer, attachmentPoint, renderGraph, result));
+            if (result) ref_viewer->addUpdateOperation(Merge::create(viewer, result));
         }
     }
 };
@@ -138,7 +154,7 @@ int main(int argc, char** argv)
         arguments.read(options);
 
         auto windowTraits = vsg::WindowTraits::create();
-        windowTraits->windowTitle = "vsgdynamicload";
+        windowTraits->windowTitle = "vsgdynamicwindows";
         windowTraits->debugLayer = arguments.read({"--debug", "-d"});
         windowTraits->apiDumpLayer = arguments.read({"--api", "-a"});
         if (arguments.read({"--fullscreen", "--fs"})) windowTraits->fullscreen = true;
@@ -226,8 +242,7 @@ int main(int argc, char** argv)
 
         // assign the LoadViewOperation that will do the load in the background and once loaded and compiled merged then via Merge operation that is assigned to updateOperations and called from viewer.update()
         vsg::observer_ptr<vsg::Viewer> observer_viewer(viewer);
-        loadThreads->add(LoadViewOperation::create(observer_viewer, window, 50, 50, 512, 480, commandGraph, "models/openstreetmap.vsgt", options));
-        loadThreads->add(LoadViewOperation::create(observer_viewer, window, 600, 50, 512, 480, commandGraph, "models/lz.vsgt", options));
+        loadThreads->add(LoadWindowOperation::create(observer_viewer, window, 50, 50, 512, 480, "models/teapot.vsgt", options));
 
         // rendering main loop
         while (viewer->advanceToNextFrame() && (numFrames < 0 || (numFrames--) > 0))
